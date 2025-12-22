@@ -66,9 +66,3 @@ if __name__ == '__main__':
     EB_save(EB, uids, EB_save_path)
     stu_rec_weak_kc = evaluate4ndcg.preprocess_stu_rec_ex(stu_rec_ex, Q_matrix, stu_true_response)
 
-    for k in [1, 3, 5, 10]:
-        hit, ndcg, f1, div, valid_test_stu_num = evaluate4ndcg.calculate_metrics(stu_true_response, stu_rec_weak_kc, stu_rec_ex, Q_matrix, k=k)
-        print(f'k = {k}, ndcg: {ndcg:.4f}, f1: {f1:.4f}, hit: {hit:.4f}, div: {div:.4f}, valid_test_stu_num: {valid_test_stu_num}')
-
-
-

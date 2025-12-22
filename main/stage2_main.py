@@ -32,10 +32,10 @@ def parse_args():
     parser.add_argument('--init_rank_len', type=int, default=150, help='the length of initial ranking list')
     parser.add_argument('--eval_step', type=int, default=1, help='the step of evaluation')
     parser.add_argument('--output_type', type=str, default='det', choices=['det', 'pro'])
-    parser.add_argument('--Q_matrix_file', type=str, default='../dataset/data_200/nips34/Q.npy')
-    parser.add_argument('--test_data_path', type=str, default='../dataset/data_200/nips34/test_sequences.csv')
-    parser.add_argument('--EB_save_path', type=str, default='../dataset/data_200/nips34/EB_mlstm3_del_0.7.txt')
-    parser.add_argument('--Reranking_result_save_path', type=str, default='../dataset/data_200/nips34/Reranking_result_melt.txt')
+    parser.add_argument('--Q_matrix_file', type=str, default='../dataset/nips34/Q.npy')
+    parser.add_argument('--test_data_path', type=str, default='../dataset/nips34/test_sequences.csv')
+    parser.add_argument('--EB_save_path', type=str, default='../dataset/nips34/EB_mlstm3_del_0.7.txt')
+    parser.add_argument('--Reranking_result_save_path', type=str, default='../dataset/nips34/Reranking_result_melt.txt')
     parser.add_argument('--device', type=str, default='cuda:1')
 
     args = parser.parse_args()
@@ -56,7 +56,6 @@ def main(args):
     Q_matrix = Q_matrix.cpu().numpy()
 
     for epoch in range(args.epochs):
-        start_time1 = time.time()
         
         model.train()
         model.istrain = True
@@ -70,7 +69,6 @@ def main(args):
             train_loss += loss.item()
 
         if epoch % args.eval_step == 0:
-            print(f'train memory allocated: {torch.cuda.memory_allocated()}bytes')
             model.eval()
             model.istrain = False
             u_rerank_list = []
@@ -93,7 +91,6 @@ def main(args):
 
 if __name__ == '__main__':
     args = parse_args()
-    print(torch.cuda.is_available())
     main(args)
 
 

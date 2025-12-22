@@ -12,11 +12,8 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 import matplotlib.pyplot as plt
 import argparse
 from module import kt_base_eval as kt_base_eval
-import time
-import psutil
-import os
 
-device = torch.device('cuda:3' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -25,19 +22,18 @@ def parse_args():
     parser.add_argument('--hidden_size', type=int, default=200, help='the size of hidden layer')
     parser.add_argument('--epochs', type=int, default=50, help='the number of epochs')
     parser.add_argument('--eval_step', type=int, default=10, help='the step of evaluation')
-    parser.add_argument('--lr', type=float, default=0.001, help='the learning rate')
+    parser.add_argument('--lr', type=float, default=0.0001, help='the learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='the weight decay')
     parser.add_argument('--train_batch_size', type=int, default=64, help='the batch size of train data')
     parser.add_argument('--test_batch_size', type=int, default=1, help='the batch size of test data')
-    parser.add_argument('--is_pkc', type=bool, default=False, help='get pkc(True) or get pkm(False)')
     parser.add_argument('--is_mlstm', type=bool, default=True, help='use lstm(False) or mlstm(True)')
-    parser.add_argument('--train_data_file', type=str, default='../dataset/data_200/assist2012/train_valid_sequences.csv',
+    parser.add_argument('--train_data_file', type=str, default='../dataset/nips34/train_valid_sequences.csv',
                         help='the path of train data')
-    parser.add_argument('--test_data_file', type=str, default='../dataset/data_200/assist2012/test_sequences.csv',
+    parser.add_argument('--test_data_file', type=str, default='../dataset/nips34/test_sequences.csv',
                         help='the path of test data')
-    parser.add_argument('--Q_file', type=str, default='../dataset/data_200/assist2012/Q.npy',
+    parser.add_argument('--Q_file', type=str, default='../dataset/nips34/Q.npy',
                         help='the path of test data')
-    parser.add_argument('--stu_ks_save_file', type=str, default='../stu_ks_save/assist2012_200', help='student ks save file')
+    parser.add_argument('--stu_ks_save_file', type=str, default='../stu_ks_save/nips34/', help='student ks save file')
     return parser.parse_args()
 
 
@@ -93,8 +89,6 @@ def main(args):
     is_pkc = args.is_pkc
     is_mlstm = args.is_mlstm
 
-    print(f"the number of concepts:{kc_num}")
-    print(f"is_mlstm:{is_mlstm}")
     train_dataset = KTDataset(train_data_file)
     train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
     user_threshold = train_dataset.user_threshold
@@ -122,10 +116,6 @@ def main(args):
     indicator_result = {'train_loss': [], 'test_auc': [], 'test_acc': []}
 
     test_data = pd.read_csv(args.test_data_file)
-    start_time = time.time()
-    process = psutil.Process(os.getpid())
-    memory_before = process.memory_info().rss
-    torch.cuda.empty_cache()
     for epoch in range(epochs):
         model.train()
         train_loss = 0.
@@ -144,17 +134,9 @@ def main(args):
             loss.backward()
             train_loss += loss.item()
             optimizer.step()
-        end_time = time.time()
-        memory_after = process.memory_info().rss
-        print(f'memory used: {(memory_after - memory_before) / (1000 * 1000)}MB')
-        print(f'train memory allocated: {torch.cuda.memory_allocated() / (1000 * 1000)}MB')
-        print(f'Epoch time: {end_time - start_time}')
         print('Epoch: {}, Loss: {:.4f}'.format(epoch, train_loss / len(train_dataloader)))
         indicator_result['train_loss'].append(train_loss / len(train_dataloader))
 
-        memory_before1 = process.memory_info().rss
-        start_time = time.time()
-        torch.cuda.empty_cache()
         if epoch % eval_step == 9:
 
             model.eval()
@@ -194,44 +176,25 @@ def main(args):
             test_kcs = torch.cat(test_kcs, dim=0)
             stu_ks_tensor = torch.stack(stu_ks_list, dim=0)
 
-            if is_pkc:
-                metrics = calculate_metrics(test_preds, test_targets, test_masks, test_kcs, kc_num, is_pkc)
-                print('Test Epoch: {}, ACC: {:.4f}'.format(epoch, metrics[1]))
-                indicator_result['test_acc'].append(metrics[1])
-                torch.save(stu_ks_tensor, f'{args.stu_ks_save_file}/pkc_5000.pth')
-            else:
-                metrics = calculate_metrics(test_preds, test_targets, test_masks, test_kcs, kc_num, is_pkc)
-                print('Test Epoch: {}, AUC: {:.4f}, ACC: {:.4f}'.format(epoch, metrics[0], metrics[1]))
-                indicator_result['test_auc'].append(metrics[0])
-                indicator_result['test_acc'].append(metrics[1])
-                torch.save(stu_ks_tensor, f'{args.stu_ks_save_file}/pkm_nomelt.pt')
-                stu_done_ks = {}
-                stu_ks_tensor = stu_ks_tensor.to('cpu').numpy()
-                for i in range(len(stu_ks_tensor)):
-                    pkm_i = stu_ks_tensor[i]
-                    kcs = [int(kc) for kc in set(test_data.iloc[i]['concepts'].split(',')) if kc != '-1']
-                    kc_last_pre = {}
-                    for kc in kcs:
-                        kc_last_pre[kc] = pkm_i[kc]
+            metrics = calculate_metrics(test_preds, test_targets, test_masks, test_kcs, kc_num, is_pkc)
+            print('Test Epoch: {}, AUC: {:.4f}, ACC: {:.4f}'.format(epoch, metrics[0], metrics[1]))
+            indicator_result['test_auc'].append(metrics[0])
+            indicator_result['test_acc'].append(metrics[1])
+            torch.save(stu_ks_tensor, f'{args.stu_ks_save_file}/pkm.pt')
+            stu_done_ks = {}
+            stu_ks_tensor = stu_ks_tensor.to('cpu').numpy()
+            for i in range(len(stu_ks_tensor)):
+                pkm_i = stu_ks_tensor[i]
+                kcs = [int(kc) for kc in set(test_data.iloc[i]['concepts'].split(',')) if kc != '-1']
+                kc_last_pre = {}
+                for kc in kcs:
+                    kc_last_pre[kc] = pkm_i[kc]
                     stu_done_ks[i] = kc_last_pre
-                stu_true_response = kt_base_eval.preprocess_test_data(test_data)
+            stu_true_response = kt_base_eval.preprocess_test_data(test_data)
 
-
-
-                for k in [1, 3, 5, 10]:
-                    hit, f1, ndcg = kt_base_eval.calculate_metrics(stu_true_response, stu_done_ks, k)
-                    print(f'k = {k}, ndcg: {ndcg:.4f}, f1: {f1:.4f}, hit: {hit:.4f}')
-                    end_time = time.time()
-                    memory_after1 = process.memory_info().rss
-                    print(f'test memory used: {(memory_after1 - memory_before1) / (1000 * 1000)}MB')
-                    print(f'test memory allocated: {torch.cuda.memory_allocated()/ (1000 * 1000)}MB')
-                    print(f'Test time: {end_time - start_time}')
     plot_results(indicator_result)
 
 
 if __name__ == '__main__':
     args = parse_args()
-    start_time = time.time()
     main(args)
-    end_time = time.time()
-    print(f'Total time: {end_time - start_time}')
