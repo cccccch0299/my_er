@@ -57,6 +57,8 @@ def parse_args():
     parser.add_argument('--eval_step', type=int, default=10, help='the step of evaluation')
     parser.add_argument('--output_type', type=str, default='det', choices=['det', 'pro'])
     parser.add_argument('--device', type=str, default='cuda:0')
+    # 创新点三：是否使用掌握度门控机制
+    parser.add_argument('--use_mastery_gate', type=bool, default=True, help='use mastery-aware gating for diversity')
 
     # 先解析一次获取 dataset 名称
     temp_args = parser.parse_known_args()[0]
@@ -131,7 +133,7 @@ def main(args):
         pbar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}')
         for batch_data in pbar:
             batch_data = [data.to(device) for data in batch_data]
-            loss, _ = model.forward(batch_data)
+            loss, _ = model.forward(batch_data, use_mastery_gate=args.use_mastery_gate)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -144,7 +146,7 @@ def main(args):
             u_rerank_list = []
             for batch_data in tqdm(test_dataloader, desc="Evaluating"):
                 batch_data = [data.to(device) for data in batch_data]
-                _, u_rerank = model.forward(batch_data)
+                _, u_rerank = model.forward(batch_data, use_mastery_gate=args.use_mastery_gate)
                 u_rerank_list.append(u_rerank.cpu().numpy())
 
             u_rerank_list = np.concatenate(u_rerank_list, axis=0)

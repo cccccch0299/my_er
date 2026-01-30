@@ -25,7 +25,7 @@ class RAPID(nn.Module):
         self.user_emb = nn.Embedding(self.user_num, self.user_hidden_size)
         self.ex_emb = nn.Embedding(self.ex_num, self.ex_hidden_size)
 
-        self.LSTM_hidden_size = args.LSTM_hidden_size  
+        self.LSTM_hidden_size = args.LSTM_hidden_size
         self.LSTM_input_size = self.user_hidden_size + self.ex_hidden_size
         self.BiLSTM_input_size = self.user_hidden_size + self.ex_hidden_size + self.kc_num
 
@@ -58,6 +58,27 @@ class RAPID(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
         self.relu = nn.ReLU()
         self.loss_func = nn.BCELoss()
+
+        # ========== 创新点三：基于掌握度的门控机制 ==========
+        # 可学习的门控参数，用于根据掌握度动态调节多样性权重
+        self.mastery_gate_w = nn.Parameter(torch.tensor(1.0))
+        self.mastery_gate_b = nn.Parameter(torch.tensor(0.0))
+
+        # 分离的相关性和多样性 MLP（添加 Sigmoid 确保输出在 [0,1] 范围内）
+        self.MLP_relevance = nn.Sequential(
+            nn.Linear(self.LSTM_hidden_size * 2, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+        self.MLP_diversity = nn.Sequential(
+            nn.Linear(self.kc_num, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+        # ========== 创新点三结束 ==========
 
 
     def Listwise_Relevance(self, user, u_init_rank_list):
@@ -136,20 +157,71 @@ class RAPID(nn.Module):
 
         return diversity_output
 
-    def re_ranking(self, relevance_output, diversity_output, u_init_rank_list, output_type='det'):
-        rel_div_combine = torch.cat([relevance_output, diversity_output], dim=-1)
+    def compute_mastery_gate(self, avg_mastery):
+        """
+        创新点三：计算基于掌握度的门控权重
 
-        if output_type == 'det':
-            re_ranking_score = self.MLP_det(rel_div_combine)  # [batch_size, init_rank_list_len, 1]
-            re_ranking_score = re_ranking_score.squeeze(-1)  # [batch_size, init_rank_list_len]
+        掌握度越低，多样性权重越低（更专注于薄弱知识点）
+        掌握度越高，多样性权重越高（可以拓展更多知识点）
+
+        Args:
+            avg_mastery: [batch_size] 每个学生的平均知识掌握度
+
+        Returns:
+            alpha: [batch_size, 1] 多样性权重
+        """
+        alpha = torch.sigmoid(self.mastery_gate_w * avg_mastery + self.mastery_gate_b)
+        return alpha.unsqueeze(-1)  # [batch_size, 1]
+
+    def re_ranking(self, relevance_output, diversity_output, u_init_rank_list,
+                   output_type='det', avg_mastery=None, use_mastery_gate=True):
+        """
+        重排序函数 - 创新点三：支持基于掌握度的门控机制
+
+        Args:
+            relevance_output: 相关性特征
+            diversity_output: 多样性特征
+            u_init_rank_list: 初始排序列表
+            output_type: 输出类型
+            avg_mastery: 学生平均掌握度 [batch_size]
+            use_mastery_gate: 是否使用掌握度门控
+
+        Returns:
+            u_rerank_list: 重排序后的列表
+            re_ranking_score_sort: 排序后的分数
+        """
+        # ========== 创新点三：基于掌握度的门控机制 ==========
+        if use_mastery_gate and avg_mastery is not None:
+            # 分别计算相关性分数和多样性分数
+            relevance_score = self.MLP_relevance(relevance_output)  # [batch_size, rank_len, 1]
+            diversity_score = self.MLP_diversity(diversity_output)  # [batch_size, rank_len, 1]
+
+            # 计算门控权重 alpha
+            alpha = self.compute_mastery_gate(avg_mastery)  # [batch_size, 1]
+            alpha = alpha.unsqueeze(1)  # [batch_size, 1, 1]
+
+            # 融合分数: Final_Score = (1 - alpha) * Relevance + alpha * Diversity
+            # 掌握度低 -> alpha 低 -> 更注重相关性（专注薄弱点）
+            # 掌握度高 -> alpha 高 -> 更注重多样性（拓展知识面）
+            re_ranking_score = (1 - alpha) * relevance_score + alpha * diversity_score
+            re_ranking_score = re_ranking_score.squeeze(-1)  # [batch_size, rank_len]
         else:
-            re_ranking_score_pro1 = self.MLP_pro1(rel_div_combine)
-            re_ranking_score_pro2 = self.MLP_pro2(rel_div_combine)
-            if self.istrain:
-                random_tensor = torch.randn(re_ranking_score_pro2.size()).to(self.device)
+            # 原始方法：直接拼接后通过 MLP
+            rel_div_combine = torch.cat([relevance_output, diversity_output], dim=-1)
+
+            if output_type == 'det':
+                re_ranking_score = self.MLP_det(rel_div_combine)
+                re_ranking_score = re_ranking_score.squeeze(-1)
             else:
-                random_tensor = 1
-            re_ranking_score = re_ranking_score_pro1 + re_ranking_score_pro2 * random_tensor
+                re_ranking_score_pro1 = self.MLP_pro1(rel_div_combine)
+                re_ranking_score_pro2 = self.MLP_pro2(rel_div_combine)
+                if self.istrain:
+                    random_tensor = torch.randn(re_ranking_score_pro2.size()).to(self.device)
+                else:
+                    random_tensor = 1
+                re_ranking_score = re_ranking_score_pro1 + re_ranking_score_pro2 * random_tensor
+                re_ranking_score = re_ranking_score.squeeze(-1)
+        # ========== 创新点三结束 ==========
 
         sort_idx = torch.argsort(re_ranking_score, dim=-1, descending=True)
         u_rerank_list = u_init_rank_list.gather(dim=1, index=sort_idx)
@@ -222,15 +294,44 @@ class RAPID(nn.Module):
 
         return valid_exercises_score, labels
 
-    def forward(self, batch_data, output_type='det'):
+    def compute_avg_mastery(self, kc_ans_situation):
+        """
+        创新点三：计算学生的平均知识掌握度
+
+        Args:
+            kc_ans_situation: [batch_size, kc_num] 学生对各知识点的掌握情况
+                              1 表示掌握，0 表示未掌握，-1 表示未接触
+
+        Returns:
+            avg_mastery: [batch_size] 每个学生的平均掌握度
+        """
+        # 只考虑已接触的知识点（值 >= 0）
+        valid_mask = (kc_ans_situation >= 0).float()
+        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # 避免除零
+
+        # 将未掌握(0)和掌握(1)的情况计算平均
+        mastery_sum = (kc_ans_situation.clamp(min=0) * valid_mask).sum(dim=1)
+        avg_mastery = mastery_sum / valid_count
+
+        return avg_mastery
+
+    def forward(self, batch_data, output_type='det', use_mastery_gate=True):
         user, questions, concepts, responses, u_init_rank_list, mask, real_seq_len, kc_ans_situation = batch_data
 
-        relevance_output = self.Listwise_Relevance(user, u_init_rank_list)  
+        relevance_output = self.Listwise_Relevance(user, u_init_rank_list)
 
         diversity_output = self.Personalized_Diversity(user, questions, concepts, u_init_rank_list, real_seq_len)
 
-        u_rerank_list, re_ranking_score_sort = self.re_ranking(relevance_output, diversity_output, u_init_rank_list,
-                                                               output_type)
+        # ========== 创新点三：计算学生平均掌握度 ==========
+        avg_mastery = None
+        if use_mastery_gate:
+            avg_mastery = self.compute_avg_mastery(kc_ans_situation)
+        # ========== 创新点三结束 ==========
+
+        u_rerank_list, re_ranking_score_sort = self.re_ranking(
+            relevance_output, diversity_output, u_init_rank_list,
+            output_type, avg_mastery=avg_mastery, use_mastery_gate=use_mastery_gate
+        )
 
         valid_exercises_score, labels = self.get_truth_labels(u_rerank_list, kc_ans_situation, re_ranking_score_sort)
 

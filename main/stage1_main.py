@@ -31,6 +31,8 @@ def parse_args():
     parser.add_argument('--test_batch_size', type=int, default=1, help='the batch size of test data')
     parser.add_argument('--is_mlstm', type=bool, default=True, help='use lstm(False) or mlstm(True)')
     parser.add_argument('--is_pkc', type=bool, default=False, help='use pkc(True) or not(False)')
+    # 创新点一：学习风格聚类数量
+    parser.add_argument('--n_clusters', type=int, default=5, help='number of learning style clusters')
 
     # 先解析一次获取 dataset 名称
     temp_args = parser.parse_known_args()[0]
@@ -146,7 +148,7 @@ def main(args):
     h_u_dataloader = DataLoader(head_user_dataset, batch_size=h_u_batch_size, shuffle=True)
 
     model = MELT_LSTM(kc_num, emb_size, hidden_size, user_min_seq_len, user_max_seq_len, user_threshold, device,
-                      epochs, is_mlstm).to(device)
+                      epochs, is_mlstm, args.n_clusters).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     best_auc = 0.0

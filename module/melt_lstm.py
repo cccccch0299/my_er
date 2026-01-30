@@ -6,7 +6,7 @@ from module.user_branch import Melt_User_Branch
 
 
 class MELT_LSTM(nn.Module):
-    def __init__(self, kc_num, emb_size, hidden_size, u_L_min, u_L_max, user_threshold, device, epochs, is_mlstm):
+    def __init__(self, kc_num, emb_size, hidden_size, u_L_min, u_L_max, user_threshold, device, epochs, is_mlstm, n_clusters=5):
         super(MELT_LSTM, self).__init__()
         self.kc_num = kc_num
         self.emb_size = emb_size
@@ -21,7 +21,8 @@ class MELT_LSTM(nn.Module):
 
         self.LSTM = LSTM(kc_num, emb_size, hidden_size, is_mlstm, u_L_max)
 
-        self.user_branch = Melt_User_Branch(emb_size, self.u_L_min, self.u_L_max, device, self.epochs)
+        # 创新点一：支持配置学习风格聚类数量
+        self.user_branch = Melt_User_Branch(emb_size, self.u_L_min, self.u_L_max, device, self.epochs, n_clusters)
 
 
     def forward(self, batch_data, h_u_batch, epoch):
