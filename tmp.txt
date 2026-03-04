@@ -1,0 +1,8 @@
+k = 1, ndcg: 0.5674, f1: 0.5674, hit: 0.5674, div: 1.4548, valid_test_stu_num: 994
+k = 3, ndcg: 0.4774, f1: 0.7136, hit: 0.4229, div: 3.1690, valid_test_stu_num: 994
+k = 5, ndcg: 0.4289, f1: 0.7517, hit: 0.3635, div: 4.7711, valid_test_stu_num: 994
+k = 10, ndcg: 0.3706, f1: 0.7722, hit: 0.3019, div: 8.7250, valid_test_stu_num: 994
+
+
+python -m main.stage1_main --dataset assist2009 --n_clusters 8 
+python -m main.stage2_main --dataset assist2009
