@@ -59,12 +59,18 @@ class RAPID(nn.Module):
         self.relu = nn.ReLU()
         self.loss_func = nn.BCELoss()
 
-        # ========== 创新点三：基于掌握度的门控机制 ==========
-        # 可学习的门控参数，用于根据掌握度动态调节多样性权重
-        self.mastery_gate_w = nn.Parameter(torch.tensor(1.0))
-        self.mastery_gate_b = nn.Parameter(torch.tensor(0.0))
+        # ========== SC-MOO: 状态条件多目标优化框架 ==========
+        # 1. 学生状态编码器
+        self.state_dim = 64
+        self.state_encoder = nn.Sequential(
+            nn.Linear(self.kc_num + self.LSTM_hidden_size + 1, 128),  # +1 for active_level
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, self.state_dim)
+        )
 
-        # 分离的相关性和多样性 MLP（添加 Sigmoid 确保输出在 [0,1] 范围内）
+        # 2. 三大独立目标打分器
+        # 2.1 相关性打分器 (Relevance Scorer)
         self.MLP_relevance = nn.Sequential(
             nn.Linear(self.LSTM_hidden_size * 2, 64),
             nn.ReLU(),
@@ -72,13 +78,33 @@ class RAPID(nn.Module):
             nn.Sigmoid()
         )
 
+        # 2.2 多样性打分器 (Diversity Scorer)
         self.MLP_diversity = nn.Sequential(
             nn.Linear(self.kc_num, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
             nn.Sigmoid()
         )
-        # ========== 创新点三结束 ==========
+
+        # 2.3 难度打分器 (Difficulty/ZPD Scorer)
+        self.MLP_difficulty = nn.Sequential(
+            nn.Linear(self.kc_num + 1, 64),  # kc_num(题目知识点) + 1(学生掌握度匹配)
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+        # 3. 状态条件帕累托门控网络 (State-Conditioned Pareto Gating)
+        self.pareto_gating = nn.Sequential(
+            nn.Linear(self.state_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3),
+            nn.Softmax(dim=-1)  # 输出 [α, β, γ]，和为1
+        )
+
+        # 4. 熵正则化系数
+        self.lambda_ent = args.lambda_ent if hasattr(args, 'lambda_ent') else 0.01
+        # ========== SC-MOO 结束 ==========
 
 
     def Listwise_Relevance(self, user, u_init_rank_list):
@@ -157,75 +183,135 @@ class RAPID(nn.Module):
 
         return diversity_output
 
-    def compute_mastery_gate(self, avg_mastery):
+    def build_student_state(self, kc_ans_situation, questions, concepts, responses, real_seq_len):
         """
-        创新点三：计算基于掌握度的门控权重
-
-        掌握度越低，多样性权重越低（更专注于薄弱知识点）
-        掌握度越高，多样性权重越高（可以拓展更多知识点）
+        SC-MOO: 构建学生实时认知状态向量
 
         Args:
-            avg_mastery: [batch_size] 每个学生的平均知识掌握度
+            kc_ans_situation: [batch_size, kc_num] 学生知识点掌握度 {-1, 0, 1}
+            questions: [batch_size, seq_len] 学生历史交互题目
+            concepts: [batch_size, seq_len] 学生历史交互知识点
+            responses: [batch_size, seq_len] 学生历史答题结果
+            real_seq_len: [batch_size] 学生真实序列长度
 
         Returns:
-            alpha: [batch_size, 1] 多样性权重
+            S_u: [batch_size, state_dim] 学生状态向量
         """
-        alpha = torch.sigmoid(self.mastery_gate_w * avg_mastery + self.mastery_gate_b)
-        return alpha.unsqueeze(-1)  # [batch_size, 1]
+        batch_size = kc_ans_situation.size(0)
 
-    def re_ranking(self, relevance_output, diversity_output, u_init_rank_list,
-                   output_type='det', avg_mastery=None, use_mastery_gate=True):
+        # 1. 知识点掌握度特征：将 {-1, 0, 1} 映射为 [0, 0.5, 1]
+        kc_state = (kc_ans_situation.float() + 1) / 2.0  # [batch_size, kc_num]
+
+        # 2. 获取 LSTM 最后时刻的 hidden state
+        x_user = torch.arange(batch_size, device=self.device)
+        x_u_emb = self.user_emb(x_user).unsqueeze(1).repeat(1, questions.size(1), 1)
+        x_q_emb = self.ex_emb(questions)
+        item_combine = torch.cat([x_u_emb, x_q_emb], dim=-1).float()
+
+        lstm_output, (h_n, c_n) = self.LSTM(item_combine)  # h_n: [1, batch_size, hidden_size]
+        lstm_hidden = h_n.squeeze(0)  # [batch_size, LSTM_hidden_size]
+
+        # 3. 活跃度特征：real_seq_len / max_seq_len
+        max_seq_len = questions.size(1)
+        active_level = (real_seq_len.float() / max_seq_len).unsqueeze(-1)  # [batch_size, 1]
+
+        # 4. 拼接所有特征
+        state_input = torch.cat([kc_state, lstm_hidden, active_level], dim=-1)
+
+        # 5. 通过状态编码器
+        S_u = self.state_encoder(state_input)  # [batch_size, state_dim]
+
+        return S_u
+
+    def compute_difficulty_features(self, u_init_rank_list, kc_ans_situation):
         """
-        重排序函数 - 创新点三：支持基于掌握度的门控机制
+        SC-MOO: 为每道候选题计算难度特征（ZPD 建模）
 
         Args:
-            relevance_output: 相关性特征
-            diversity_output: 多样性特征
-            u_init_rank_list: 初始排序列表
-            output_type: 输出类型
-            avg_mastery: 学生平均掌握度 [batch_size]
-            use_mastery_gate: 是否使用掌握度门控
+            u_init_rank_list: [batch_size, rank_len] 候选题目列表
+            kc_ans_situation: [batch_size, kc_num] 学生知识点掌握度
 
         Returns:
-            u_rerank_list: 重排序后的列表
-            re_ranking_score_sort: 排序后的分数
+            difficulty_features: [batch_size, rank_len, kc_num+1]
         """
-        # ========== 创新点三：基于掌握度的门控机制 ==========
-        if use_mastery_gate and avg_mastery is not None:
-            # 分别计算相关性分数和多样性分数
-            relevance_score = self.MLP_relevance(relevance_output)  # [batch_size, rank_len, 1]
-            diversity_score = self.MLP_diversity(diversity_output)  # [batch_size, rank_len, 1]
+        batch_size, rank_len = u_init_rank_list.shape
 
-            # 计算门控权重 alpha
-            alpha = self.compute_mastery_gate(avg_mastery)  # [batch_size, 1]
-            alpha = alpha.unsqueeze(1)  # [batch_size, 1, 1]
+        # 将 kc_ans_situation 映射为连续值 [0, 0.5, 1]
+        kc_mastery = (kc_ans_situation.float() + 1) / 2.0  # [batch_size, kc_num]
 
-            # 融合分数: Final_Score = (1 - alpha) * Relevance + alpha * Diversity
-            # 掌握度低 -> alpha 低 -> 更注重相关性（专注薄弱点）
-            # 掌握度高 -> alpha 高 -> 更注重多样性（拓展知识面）
-            re_ranking_score = (1 - alpha) * relevance_score + alpha * diversity_score
-            re_ranking_score = re_ranking_score.squeeze(-1)  # [batch_size, rank_len]
-        else:
-            # 原始方法：直接拼接后通过 MLP
-            rel_div_combine = torch.cat([relevance_output, diversity_output], dim=-1)
+        difficulty_features = []
 
-            if output_type == 'det':
-                re_ranking_score = self.MLP_det(rel_div_combine)
-                re_ranking_score = re_ranking_score.squeeze(-1)
-            else:
-                re_ranking_score_pro1 = self.MLP_pro1(rel_div_combine)
-                re_ranking_score_pro2 = self.MLP_pro2(rel_div_combine)
-                if self.istrain:
-                    random_tensor = torch.randn(re_ranking_score_pro2.size()).to(self.device)
-                else:
-                    random_tensor = 1
-                re_ranking_score = re_ranking_score_pro1 + re_ranking_score_pro2 * random_tensor
-                re_ranking_score = re_ranking_score.squeeze(-1)
-        # ========== 创新点三结束 ==========
+        for i in range(batch_size):
+            student_mastery = kc_mastery[i]  # [kc_num]
+            student_features = []
 
-        sort_idx = torch.argsort(re_ranking_score, dim=-1, descending=True)
+            for j in range(rank_len):
+                ex_id = u_init_rank_list[i, j]
+                ex_kcs = self.Q_matrix[ex_id].float()  # [kc_num] 题目涉及的知识点
+
+                # 计算学生对该题涉及知识点的平均掌握度
+                relevant_mastery = student_mastery * ex_kcs  # 只保留题目涉及的知识点
+                kc_count = ex_kcs.sum().clamp(min=1)  # 避免除零
+                avg_mastery = relevant_mastery.sum() / kc_count  # 标量
+
+                # 拼接特征：[题目知识点向量, 学生平均掌握度]
+                feature = torch.cat([ex_kcs, avg_mastery.unsqueeze(0)])  # [kc_num + 1]
+                student_features.append(feature)
+
+            difficulty_features.append(torch.stack(student_features))
+
+        return torch.stack(difficulty_features)  # [batch_size, rank_len, kc_num+1]
+
+    def compute_pareto_entropy(self, pareto_weights):
+        """
+        SC-MOO: 计算帕累托权重的熵（用于正则化）
+
+        Args:
+            pareto_weights: [batch_size, 3] 帕累托权重 [α, β, γ]
+
+        Returns:
+            entropy: 标量，平均熵
+        """
+        # 避免 log(0)
+        eps = 1e-8
+        entropy = -(pareto_weights * torch.log(pareto_weights + eps)).sum(dim=-1).mean()
+        return entropy
+
+    def re_ranking(self, relevance_output, diversity_output, difficulty_output,
+                   pareto_weights, u_init_rank_list):
+        """
+        SC-MOO: 状态条件多目标优化重排序
+
+        Args:
+            relevance_output: [batch_size, rank_len, LSTM_hidden_size*2] 相关性特征
+            diversity_output: [batch_size, rank_len, kc_num] 多样性特征
+            difficulty_output: [batch_size, rank_len, kc_num+1] 难度特征
+            pareto_weights: [batch_size, 3] 帕累托权重 [α, β, γ]
+            u_init_rank_list: [batch_size, rank_len] 初始排序列表
+
+        Returns:
+            u_rerank_list: [batch_size, rank_len] 重排序后的列表
+            re_ranking_score_sort: [batch_size, rank_len] 排序后的分数
+        """
+        # 1. 三个独立目标打分器
+        S_rel = self.MLP_relevance(relevance_output)    # [batch_size, rank_len, 1]
+        S_div = self.MLP_diversity(diversity_output)    # [batch_size, rank_len, 1]
+        S_diff = self.MLP_difficulty(difficulty_output) # [batch_size, rank_len, 1]
+
+        # 2. 提取帕累托权重
+        alpha = pareto_weights[:, 0:1].unsqueeze(1)   # [batch_size, 1, 1]
+        beta = pareto_weights[:, 1:2].unsqueeze(1)    # [batch_size, 1, 1]
+        gamma = pareto_weights[:, 2:3].unsqueeze(1)   # [batch_size, 1, 1]
+
+        # 3. 动态标量化融合
+        # Final_Score = α * S_rel + β * S_div + γ * S_diff
+        final_score = alpha * S_rel + beta * S_div + gamma * S_diff
+        final_score = final_score.squeeze(-1)  # [batch_size, rank_len]
+
+        # 4. 排序
+        sort_idx = torch.argsort(final_score, dim=-1, descending=True)
         u_rerank_list = u_init_rank_list.gather(dim=1, index=sort_idx)
-        re_ranking_score_sort, _ = torch.sort(re_ranking_score, dim=1, descending=True)
+        re_ranking_score_sort, _ = torch.sort(final_score, dim=1, descending=True)
 
         return u_rerank_list, re_ranking_score_sort
 
@@ -294,48 +380,55 @@ class RAPID(nn.Module):
 
         return valid_exercises_score, labels
 
-    def compute_avg_mastery(self, kc_ans_situation):
+    def forward(self, batch_data):
         """
-        创新点三：计算学生的平均知识掌握度
+        SC-MOO: 前向传播
 
         Args:
-            kc_ans_situation: [batch_size, kc_num] 学生对各知识点的掌握情况
-                              1 表示掌握，0 表示未掌握，-1 表示未接触
+            batch_data: (user, questions, concepts, responses, u_init_rank_list,
+                        mask, real_seq_len, kc_ans_situation)
 
         Returns:
-            avg_mastery: [batch_size] 每个学生的平均掌握度
+            loss: 总损失（BCE Loss + 熵正则化）
+            u_rerank_list: 重排序后的题目列表
         """
-        # 只考虑已接触的知识点（值 >= 0）
-        valid_mask = (kc_ans_situation >= 0).float()
-        valid_count = valid_mask.sum(dim=1).clamp(min=1)  # 避免除零
-
-        # 将未掌握(0)和掌握(1)的情况计算平均
-        mastery_sum = (kc_ans_situation.clamp(min=0) * valid_mask).sum(dim=1)
-        avg_mastery = mastery_sum / valid_count
-
-        return avg_mastery
-
-    def forward(self, batch_data, output_type='det', use_mastery_gate=True):
         user, questions, concepts, responses, u_init_rank_list, mask, real_seq_len, kc_ans_situation = batch_data
 
+        # 1. 相关性特征提取
         relevance_output = self.Listwise_Relevance(user, u_init_rank_list)
 
-        diversity_output = self.Personalized_Diversity(user, questions, concepts, u_init_rank_list, real_seq_len)
+        # 2. 多样性特征提取
+        diversity_output = self.Personalized_Diversity(user, questions, concepts,
+                                                        u_init_rank_list, real_seq_len)
 
-        # ========== 创新点三：计算学生平均掌握度 ==========
-        avg_mastery = None
-        if use_mastery_gate:
-            avg_mastery = self.compute_avg_mastery(kc_ans_situation)
-        # ========== 创新点三结束 ==========
+        # 3. 构建学生状态向量
+        S_u = self.build_student_state(kc_ans_situation, questions, concepts,
+                                        responses, real_seq_len)
 
+        # 4. 帕累托门控网络：动态输出三目标权重
+        pareto_weights = self.pareto_gating(S_u)  # [batch_size, 3]
+
+        # 5. 难度特征提取
+        difficulty_output = self.compute_difficulty_features(u_init_rank_list, kc_ans_situation)
+
+        # 6. SC-MOO 重排序
         u_rerank_list, re_ranking_score_sort = self.re_ranking(
-            relevance_output, diversity_output, u_init_rank_list,
-            output_type, avg_mastery=avg_mastery, use_mastery_gate=use_mastery_gate
+            relevance_output, diversity_output, difficulty_output,
+            pareto_weights, u_init_rank_list
         )
 
-        valid_exercises_score, labels = self.get_truth_labels(u_rerank_list, kc_ans_situation, re_ranking_score_sort)
+        # 7. 计算 BCE 损失
+        valid_exercises_score, labels = self.get_truth_labels(u_rerank_list,
+                                                               kc_ans_situation,
+                                                               re_ranking_score_sort)
+        bce_loss = self.loss_func(valid_exercises_score, labels)
 
-        loss = self.loss_func(valid_exercises_score, labels)
+        # 8. 计算帕累托权重的熵正则化
+        entropy = self.compute_pareto_entropy(pareto_weights)
+
+        # 9. 总损失：BCE Loss - λ_ent * Entropy
+        # 负号是因为我们希望最大化熵（鼓励权重分布更均匀，避免退化）
+        loss = bce_loss - self.lambda_ent * entropy
 
         return loss, u_rerank_list
 
