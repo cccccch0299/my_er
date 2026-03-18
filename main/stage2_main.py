@@ -128,6 +128,12 @@ def main(args):
     logger.info(f"Starting Stage 2 Training for dataset: {args.dataset}")
     logger.info(f"Arguments: {vars(args)}")
 
+    # 初始化模型保存目录与最佳分数
+    save_dir = os.path.join('./save', args.dataset)
+    os.makedirs(save_dir, exist_ok=True)
+    best_save_path = os.path.join(save_dir, 'rapid_best_model.pt')
+    best_combined_score = -1.0
+
     dataset = Rapid_Dataset(args)
     test_data = pd.read_csv(args.test_data_path)
 
@@ -136,7 +142,7 @@ def main(args):
 
     model = RAPID(args).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg_lambda)
-    
+
     Q_matrix = torch.tensor(np.load(args.Q_matrix_file)).to(device)
     Q_matrix_cpu = Q_matrix.cpu().numpy()
 
@@ -176,6 +182,18 @@ def main(args):
                        f"Div: {metrics['div'][f'@{k}']:.4f}")
                 logger.info(msg)
             logger.info("-" * 60)
+
+            # 综合指标：NDCG@10 + Recall@10
+            ndcg_10 = metrics['ndcg']['@10']
+            recall_10 = metrics['recall']['@10']
+            combined_score = ndcg_10 + recall_10
+
+            if combined_score > best_combined_score:
+                best_combined_score = combined_score
+                torch.save(model.state_dict(), best_save_path)
+                logger.info(f"[Best Model Saved] Epoch {epoch+1} | "
+                            f"NDCG@10: {ndcg_10:.4f}, Recall@10: {recall_10:.4f}, "
+                            f"Combined: {combined_score:.4f} -> {best_save_path}")
 
             # 保存推荐结果
             uid = test_data['uid'].tolist()
